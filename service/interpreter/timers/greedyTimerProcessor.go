@@ -1,24 +1,33 @@
-package interpreter
+package timers
 
 import (
-	"time"
-
 	"github.com/indeedeng/iwf/gen/iwfidl"
 	"github.com/indeedeng/iwf/service"
+	"github.com/indeedeng/iwf/service/interpreter/cont"
+	"github.com/indeedeng/iwf/service/interpreter/interfaces"
 )
 
-type TimerProcessor struct {
+type GreedyTimerProcessor struct {
+	timerManager                    *timerScheduler
 	stateExecutionCurrentTimerInfos map[string][]*service.TimerInfo
 	staleSkipTimerSignals           []service.StaleSkipTimerSignal
-	provider                        WorkflowProvider
-	logger                          UnifiedLogger
+	provider                        interfaces.WorkflowProvider
+	logger                          interfaces.UnifiedLogger
 }
 
-func NewTimerProcessor(
-	ctx UnifiedContext, provider WorkflowProvider, staleSkipTimerSignals []service.StaleSkipTimerSignal,
-) *TimerProcessor {
-	tp := &TimerProcessor{
+func NewGreedyTimerProcessor(
+	ctx interfaces.UnifiedContext,
+	provider interfaces.WorkflowProvider,
+	continueAsNewCounter *cont.ContinueAsNewCounter,
+	staleSkipTimerSignals []service.StaleSkipTimerSignal,
+) *GreedyTimerProcessor {
+
+	// start some single thread that manages pendingScheduling
+	scheduler := startGreedyTimerScheduler(ctx, provider, continueAsNewCounter)
+
+	tp := &GreedyTimerProcessor{
 		provider:                        provider,
+		timerManager:                    scheduler,
 		stateExecutionCurrentTimerInfos: map[string][]*service.TimerInfo{},
 		logger:                          provider.GetLogger(ctx),
 		staleSkipTimerSignals:           staleSkipTimerSignals,
@@ -32,19 +41,26 @@ func NewTimerProcessor(
 	if err != nil {
 		panic("cannot set query handler")
 	}
+
+	err = provider.SetQueryHandler(ctx, service.GetScheduledGreedyTimerTimesQueryType, func() (service.GetScheduledGreedyTimerTimesQueryResponse, error) {
+		return service.GetScheduledGreedyTimerTimesQueryResponse{
+			ScheduledGreedyTimerTimes: tp.timerManager.scheduledTimerTimes,
+			PendingScheduled:          tp.timerManager.pendingScheduling,
+		}, nil
+	})
+	if err != nil {
+		panic("cannot set query handler")
+	}
+
 	return tp
 }
 
-func (t *TimerProcessor) Dump() []service.StaleSkipTimerSignal {
+func (t *GreedyTimerProcessor) Dump() []service.StaleSkipTimerSignal {
 	return t.staleSkipTimerSignals
 }
 
-func (t *TimerProcessor) GetCurrentTimerInfos() map[string][]*service.TimerInfo {
-	return t.stateExecutionCurrentTimerInfos
-}
-
 // SkipTimer will attempt to skip a timer, return false if no valid timer found
-func (t *TimerProcessor) SkipTimer(stateExeId, timerId string, timerIdx int) bool {
+func (t *GreedyTimerProcessor) SkipTimer(stateExeId, timerId string, timerIdx int) bool {
 	timer, valid := service.ValidateTimerSkipRequest(t.stateExecutionCurrentTimerInfos, stateExeId, timerId, timerIdx)
 	if !valid {
 		// since we have checked it before sending signals, this should only happen in some vary rare cases for racing condition
@@ -61,7 +77,7 @@ func (t *TimerProcessor) SkipTimer(stateExeId, timerId string, timerIdx int) boo
 	return true
 }
 
-func (t *TimerProcessor) RetryStaleSkipTimer() bool {
+func (t *GreedyTimerProcessor) RetryStaleSkipTimer() bool {
 	for i, staleSkip := range t.staleSkipTimerSignals {
 		found := t.SkipTimer(staleSkip.StateExecutionId, staleSkip.TimerCommandId, staleSkip.TimerCommandIndex)
 		if found {
@@ -73,16 +89,11 @@ func (t *TimerProcessor) RetryStaleSkipTimer() bool {
 	return false
 }
 
-func removeElement(s []service.StaleSkipTimerSignal, i int) []service.StaleSkipTimerSignal {
-	s[i] = s[len(s)-1]
-	return s[:len(s)-1]
-}
-
 // WaitForTimerFiredOrSkipped waits for timer completed(fired or skipped),
 // return true when the timer is fired or skipped
 // return false if the waitingCommands is canceled by cancelWaiting bool pointer(when the trigger type is completed, or continueAsNew)
-func (t *TimerProcessor) WaitForTimerFiredOrSkipped(
-	ctx UnifiedContext, stateExeId string, timerIdx int, cancelWaiting *bool,
+func (t *GreedyTimerProcessor) WaitForTimerFiredOrSkipped(
+	ctx interfaces.UnifiedContext, stateExeId string, timerIdx int, cancelWaiting *bool,
 ) service.InternalTimerStatus {
 	timerInfos := t.stateExecutionCurrentTimerInfos[stateExeId]
 	if len(timerInfos) == 0 {
@@ -102,31 +113,43 @@ func (t *TimerProcessor) WaitForTimerFiredOrSkipped(
 	skippedByStaleSkip := t.RetryStaleSkipTimer()
 	if skippedByStaleSkip {
 		t.logger.Warn("timer skipped by stale skip signal", stateExeId, timerIdx)
+		timer.Status = service.TimerSkipped
 		return service.TimerSkipped
 	}
-	now := t.provider.Now(ctx).Unix()
-	fireAt := timer.FiringUnixTimestampSeconds
-	duration := time.Duration(fireAt-now) * time.Second
-	future := t.provider.NewTimer(ctx, duration)
+
 	_ = t.provider.Await(ctx, func() bool {
-		return future.IsReady() || timer.Status == service.TimerSkipped || *cancelWaiting
+		// This is trigger when one of the timers scheduled by the timerScheduler fires, scheduling a
+		//   new workflow task that evaluates the workflow's goroutines
+		return timer.Status == service.TimerFired || timer.Status == service.TimerSkipped || timer.FiringUnixTimestampSeconds <= t.provider.Now(ctx).Unix() || *cancelWaiting
 	})
+
 	if timer.Status == service.TimerSkipped {
 		return service.TimerSkipped
 	}
-	if future.IsReady() {
+
+	if timer.FiringUnixTimestampSeconds <= t.provider.Now(ctx).Unix() {
+		timer.Status = service.TimerFired
 		return service.TimerFired
 	}
+
 	// otherwise *cancelWaiting should return false to indicate that this timer isn't completed(fired or skipped)
+	t.timerManager.removeTimer(timer)
 	return service.TimerPending
 }
 
-// RemovePendingTimersOfState is for when a state is completed, remove all its pending timers
-func (t *TimerProcessor) RemovePendingTimersOfState(stateExeId string) {
+// RemovePendingTimersOfState is for when a state is completed, remove all its pending pendingScheduling
+func (t *GreedyTimerProcessor) RemovePendingTimersOfState(stateExeId string) {
+
+	timers := t.stateExecutionCurrentTimerInfos[stateExeId]
+
+	for _, timer := range timers {
+		t.timerManager.removeTimer(timer)
+	}
+
 	delete(t.stateExecutionCurrentTimerInfos, stateExeId)
 }
 
-func (t *TimerProcessor) AddTimers(
+func (t *GreedyTimerProcessor) AddTimers(
 	stateExeId string, commands []iwfidl.TimerCommand, completedTimerCmds map[int]service.InternalTimerStatus,
 ) {
 	timers := make([]*service.TimerInfo, len(commands))
@@ -145,26 +168,10 @@ func (t *TimerProcessor) AddTimers(
 				Status:                     service.TimerPending,
 			}
 		}
-
+		if timer.Status == service.TimerPending {
+			t.timerManager.addTimer(&timer)
+		}
 		timers[idx] = &timer
 	}
 	t.stateExecutionCurrentTimerInfos[stateExeId] = timers
-}
-
-// FixTimerCommandFromActivityOutput converts the durationSeconds to firingUnixTimestampSeconds
-// doing it right after the activity output so that we don't need to worry about the time drift after continueAsNew
-func FixTimerCommandFromActivityOutput(now time.Time, request iwfidl.CommandRequest) iwfidl.CommandRequest {
-	var timerCommands []iwfidl.TimerCommand
-	for _, cmd := range request.GetTimerCommands() {
-		if cmd.HasDurationSeconds() {
-			timerCommands = append(timerCommands, iwfidl.TimerCommand{
-				CommandId:                  cmd.CommandId,
-				FiringUnixTimestampSeconds: iwfidl.PtrInt64(now.Unix() + int64(cmd.GetDurationSeconds())),
-			})
-		} else {
-			timerCommands = append(timerCommands, cmd)
-		}
-	}
-	request.TimerCommands = timerCommands
-	return request
 }
